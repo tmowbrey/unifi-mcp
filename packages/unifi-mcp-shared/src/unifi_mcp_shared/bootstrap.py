@@ -10,7 +10,11 @@ import importlib.resources
 import logging
 import os
 import re
+import shlex
+import shutil
+import signal
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
@@ -21,6 +25,11 @@ from unifi_core.redaction import is_sensitive_key, redact_sensitive_fields
 EXIT_SECRET_UNRESOLVED = 6
 
 _SECRET_MAX_BYTES = 64 * 1024
+
+# How long a credential helper may take, and how long its process tree gets to
+# die after SIGTERM before SIGKILL.
+_SECRET_COMMAND_TIMEOUT_S = 30
+_SECRET_COMMAND_GRACE_S = 2
 
 # Names of the variables the process was started with, recorded by
 # load_process_env() before any .env file is loaded. ``None`` means no snapshot
@@ -112,13 +121,171 @@ def _read_secret_file(var: str, path_str: str, logger: logging.Logger) -> str:
             data = handle.read(_SECRET_MAX_BYTES + 1)
     except OSError as exc:
         _fail_secret(logger, "%s points at %s, which could not be read: %s", var, path, exc.strerror or exc)
+    return _decode_secret(var, data, str(path), logger)
+
+
+def _trusted_environ() -> dict[str, str]:
+    """The environment restricted to the names the process was started with.
+
+    A ``.env`` loaded from the working directory can introduce names the process
+    never had, including loader variables such as ``PYTHONPATH`` or ``LD_PRELOAD``
+    that would run code inside the helper. Values are read from the live
+    environment because ``load_dotenv`` never overrides an existing name. With no
+    snapshot taken the whole environment is trusted, which is what a plain
+    ``dict(os.environ)`` says.
+    """
+    if _TRUSTED_VARS is None:
+        return dict(os.environ)
+    return {name: value for name, value in os.environ.items() if name in _TRUSTED_VARS}
+
+
+def _decode_secret(var: str, data: bytes, subject: str, logger: logging.Logger) -> str:
+    """Enforce the size cap and decode, or refuse startup naming ``subject`` only."""
     if len(data) > _SECRET_MAX_BYTES:
-        _fail_secret(logger, "%s points at %s, which is larger than %d bytes.", var, path, _SECRET_MAX_BYTES)
+        _fail_secret(logger, "%s: %s produced more than %d bytes.", var, subject, _SECRET_MAX_BYTES)
     try:
         # utf-8-sig drops a BOM left by editors that save "UTF-8 with BOM".
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        _fail_secret(logger, "%s points at %s, which is not valid UTF-8.", var, path)
+        _fail_secret(logger, "%s: %s produced output that is not valid UTF-8.", var, subject)
+
+
+def _neutral_working_directory() -> str:
+    """The helper's working directory: anywhere but the project the client opened.
+
+    Python puts the working directory on ``sys.path``, so inheriting it lets that
+    project decide what ``python -m helper`` imports. See "Process lifecycle" in
+    ``docs/credential-providers.md``.
+    """
+    if os.name == "nt":
+        return os.environ.get("SystemRoot") or "C:\\"
+    return "/"
+
+
+def _resolve_executable(var: str, argv0: str, env: dict[str, str], logger: logging.Logger) -> str:
+    """Resolve the helper to an absolute path under the executable contract.
+
+    Absolute paths are taken as given. A bare name is looked up on the trusted
+    ``PATH``. Anything else names a location relative to a working directory the
+    operator did not choose, so it is refused rather than guessed.
+    """
+    if os.path.isabs(argv0):
+        return argv0
+    if os.path.dirname(argv0):
+        _fail_secret(
+            logger,
+            "%s: %r is a relative path. Give the helper's absolute path, or a bare name found on PATH.",
+            var,
+            argv0,
+        )
+    found = shutil.which(argv0, path=env.get("PATH"))
+    if found is None:
+        _fail_secret(
+            logger,
+            "%s: %r was not found on PATH. Give the helper's absolute path.",
+            var,
+            argv0,
+        )
+    return found
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate the helper and everything it started.
+
+    The helper is its own session leader (POSIX) or process-group root
+    (Windows), so a background descendant holding the output pipe open is killed
+    with it rather than outliving the server's startup.
+    """
+
+    def _reap() -> bool:
+        """Drain the pipe and reap; ``wait`` alone can block on a held-open pipe."""
+        try:
+            proc.communicate(timeout=_SECRET_COMMAND_GRACE_S)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        _reap()
+        return
+    try:
+        group = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, sig)
+        except ProcessLookupError:
+            return
+        if _reap():
+            return
+
+
+def _run_secret_command(var: str, command: str, logger: logging.Logger) -> str:
+    """Run *command* as an argv (no shell) and return its stdout.
+
+    Nothing the helper writes is ever logged: it may print the credential to
+    either stream, and a failing helper often does. The full contract is in
+    ``docs/credential-providers.md``.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        _fail_secret(logger, "%s could not be parsed as a command line (check the quoting).", var)
+    if not argv:
+        _fail_secret(logger, "%s is set but contains no command.", var)
+
+    env = _trusted_environ()
+    executable = _resolve_executable(var, argv[0], env, logger)
+    name = os.path.basename(executable)
+
+    platform_kwargs: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    )
+    try:
+        # No shell is involved. stdin is closed because under stdio transport it
+        # is the MCP client's JSON-RPC pipe and a prompting helper must not read
+        # it. stderr is discarded rather than captured; see the docstring.
+        proc = subprocess.Popen(  # noqa: S603 -- argv from the operator's own environment, never a shell
+            [executable, *argv[1:]],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=_neutral_working_directory(),
+            env=env,
+            **platform_kwargs,
+        )
+    except OSError as exc:
+        _fail_secret(logger, "%s: could not run %s (%s).", var, name, exc.strerror or type(exc).__name__)
+
+    try:
+        stdout, _ = proc.communicate(timeout=_SECRET_COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        _fail_secret(
+            logger,
+            "%s: %s did not finish within %ss; its process tree was terminated.",
+            var,
+            name,
+            _SECRET_COMMAND_TIMEOUT_S,
+        )
+
+    if proc.returncode != 0:
+        _fail_secret(
+            logger,
+            "%s: %s exited with status %s. Its output is not logged; run the helper yourself to see why.",
+            var,
+            name,
+            proc.returncode,
+        )
+    return _decode_secret(var, stdout, name, logger)
 
 
 def resolve_env(key: str, *, env_prefix: str, logger: logging.Logger) -> str | None:
@@ -130,39 +297,52 @@ def resolve_env(key: str, *, env_prefix: str, logger: logging.Logger) -> str | N
     the shared level.
 
     Secret keys (by :func:`unifi_core.redaction.is_sensitive_key`: ``password``,
-    ``api_key``) also accept ``<VAR>_FILE``, a path whose contents are the value
-    (trailing newlines dropped). Setting both spellings at one level, or a file
-    that cannot be read, refuses startup with :data:`EXIT_SECRET_UNRESOLVED`.
+    ``api_key``) also accept two indirect spellings, whose value is the resolved
+    secret with trailing newlines dropped:
+
+    * ``<VAR>_FILE``     a path whose contents are the value
+    * ``<VAR>_COMMAND``  an argv, run without a shell, whose stdout is the value
+
+    Setting more than one spelling at one level, or an indirection that cannot be
+    resolved, refuses startup with :data:`EXIT_SECRET_UNRESOLVED`.
 
     Returns:
         The resolved value, or ``None`` when nothing is set at either level.
     """
     upper = key.upper()
     secret = is_sensitive_key(key)
+    readers = (("_FILE", _read_secret_file), ("_COMMAND", _run_secret_command))
     for base in (f"UNIFI_{env_prefix}_{upper}", f"UNIFI_{upper}"):
-        plain = os.getenv(base)
-        file_var = f"{base}_FILE"
-        path = os.getenv(file_var) if secret else None
-        if plain and path:
-            _fail_secret(logger, "%s and %s are both set; keep exactly one of them.", _origin(base), _origin(file_var))
-        if plain:
-            return plain
-        if not path:
+        candidates: list[tuple[str, str, Any]] = []
+        if plain := os.getenv(base):
+            candidates.append((base, plain, None))
+        if secret:
+            for suffix, reader in readers:
+                indirect_var = f"{base}{suffix}"
+                if raw := os.getenv(indirect_var):
+                    candidates.append((indirect_var, raw, reader))
+        if len(candidates) > 1:
+            names = ", ".join(_origin(var) for var, _, _ in candidates)
+            _fail_secret(logger, "%s are set; keep exactly one of them.", names)
+        if not candidates:
             continue
-        if _TRUSTED_VARS is not None and file_var not in _TRUSTED_VARS:
+        var, raw, reader = candidates[0]
+        if reader is None:
+            return raw
+        if _TRUSTED_VARS is not None and var not in _TRUSTED_VARS:
             _fail_secret(
                 logger,
                 "%s was supplied by a .env file, not by the environment the server was started with; "
                 "credential indirection is only honoured from the process environment.",
-                file_var,
+                var,
             )
-        value = _read_secret_file(file_var, path, logger).rstrip("\r\n")
+        value = reader(var, raw, logger).rstrip("\r\n")
         if not value:
-            _fail_secret(logger, "%s resolved to an empty value.", file_var)
+            _fail_secret(logger, "%s resolved to an empty value.", var)
         if "\n" in value:
             # A second line is not part of the secret; a wrong value accepted here
             # would surface later as an unexplained 401.
-            _fail_secret(logger, "%s holds %d lines; expected exactly one.", file_var, value.count("\n") + 1)
+            _fail_secret(logger, "%s holds %d lines; expected exactly one.", var, value.count("\n") + 1)
         return value
     return None
 
@@ -183,7 +363,7 @@ def load_server_config(
 
     Then merges server-specific env vars (e.g. ``UNIFI_NETWORK_HOST``)
     with fallback to shared vars (e.g. ``UNIFI_HOST``) via :func:`resolve_env`.
-    Secret keys may also be supplied as ``..._FILE``.
+    Secret keys may also be supplied as ``..._FILE`` or ``..._COMMAND``.
 
     Args:
         package_name: Dotted package name for importlib.resources

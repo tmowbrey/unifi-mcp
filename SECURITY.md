@@ -49,7 +49,7 @@ UniFi MCP is designed with a **secure-by-default** posture:
 
 - Credentials (username/password) are used to authenticate directly with your local UniFi controller
 - Credentials never leave your network — they are not sent to any external service
-- Credentials can be kept out of the MCP client's environment with `UNIFI_<SERVER>_PASSWORD_FILE`; the indirection is honoured only from the environment the server was started with, never from a `.env` file in the working directory
+- Credentials can be kept out of the MCP client's environment with `UNIFI_<SERVER>_PASSWORD_FILE` or `UNIFI_<SERVER>_PASSWORD_COMMAND`; both indirections are honoured only from the environment the server was started with, never from a `.env` file in the working directory. The command provider's platform, executable-resolution and process-lifecycle contract is in [docs/credential-providers.md](docs/credential-providers.md)
 - API key authentication is supported as an experimental additive option
 - The relay sidecar connects to a Cloudflare Worker via token-scoped WebSocket — no inbound ports are exposed
 

@@ -24,11 +24,18 @@ The Network server supports server-specific environment variables with the `UNIF
 
 ### Keeping the password out of the client environment
 
-`UNIFI_NETWORK_PASSWORD` and `UNIFI_NETWORK_API_KEY` (and their `UNIFI_*` fallbacks) each accept an indirect spelling, `UNIFI_NETWORK_PASSWORD_FILE=<path>` (and `UNIFI_NETWORK_API_KEY_FILE`), a file whose contents are the value (Docker and systemd secrets convention; trailing newlines dropped), so the secret only ever exists inside the server process.
+`UNIFI_NETWORK_PASSWORD` and `UNIFI_NETWORK_API_KEY` (and their `UNIFI_*` fallbacks) each accept two indirect spellings, so the secret only ever exists inside the server process:
 
-Set exactly one spelling per level: `UNIFI_NETWORK_PASSWORD` next to `UNIFI_NETWORK_PASSWORD_FILE` refuses to start as ambiguous. A missing, unreadable, empty, multi-line or oversized file also refuses to start (exit code 6) with the variable name in the log; the file's contents are never logged. `UNIFI_NETWORK_API_KEY_FILE` behaves the same way.
+| Variable | Value |
+|----------|-------|
+| `UNIFI_NETWORK_PASSWORD_FILE` | Path to a file whose contents are the password (Docker and systemd secrets convention). Trailing newlines dropped. |
+| `UNIFI_NETWORK_PASSWORD_COMMAND` | An absolute argv whose stdout is the password, for example `/usr/bin/pass show unifi/admin`. Run without a shell, in a neutral working directory, with stdin closed and stderr discarded. |
 
-One boundary to know about. The indirection is honoured only from the environment the server process was started with (an exported variable, the MCP client's `env` block, Docker `environment:` or `env_file:`), never from a `.env` file the server itself loads from its working directory, so a `.env` inside an untrusted project cannot make the server read an arbitrary file.
+`UNIFI_NETWORK_API_KEY_FILE` and `UNIFI_NETWORK_API_KEY_COMMAND` behave the same way. Set exactly one spelling per level: `UNIFI_NETWORK_PASSWORD` next to `UNIFI_NETWORK_PASSWORD_FILE` refuses to start as ambiguous. A missing, unreadable, empty, multi-line or oversized file, an unresolvable or failing helper, and a helper that exceeds its 30-second timeout all refuse to start (exit code 6) with the variable name in the log; neither the file's contents nor anything the helper writes is ever logged.
+
+One boundary to know about. The indirections are honoured only from the environment the server process was started with (an exported variable, the MCP client's `env` block, Docker `environment:` or `env_file:`), never from a `.env` file the server itself loads from its working directory, so a `.env` inside an untrusted project cannot make the server read an arbitrary file or run a program. The helper also runs with that starting environment, so provider settings such as `PASSWORD_STORE_DIR` or `GPG_TTY` must be exported to the server rather than written into a `.env`.
+
+The command provider's supported platforms, executable-resolution rule and process lifecycle are specified in [docs/credential-providers.md](../../../docs/credential-providers.md).
 
 ## Controller Type Detection
 
